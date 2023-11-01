@@ -50,9 +50,10 @@ def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, c
             (idx, labels, _, context_ids, context_mask) = batch
 
             train_loss = model(
-                input_ids=context_ids.cuda(),
-                attention_mask=context_mask.cuda(),
-                labels=labels.cuda()
+                input_ids=context_ids.cuda(), 
+                attention_mask=context_mask.cuda(), 
+                labels=labels.cuda(), 
+                return_dict=False
             )[0]
 
             train_loss.backward()

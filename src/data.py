@@ -29,9 +29,9 @@ class Dataset(torch.utils.data.Dataset):
     def get_target(self, example):
         if 'target' in example:
             target = example['target']
-            return target + ' </s>'
+            return target
         elif 'answers' in example:
-            return random.choice(example['answers']) + ' </s>'
+            return random.choice(example['answers'])
         else:
             return None
 
@@ -76,7 +76,7 @@ def encode_passages(batch_text_passages, tokenizer, max_length):
         p = tokenizer.batch_encode_plus(
             text_passages,
             max_length=max_length,
-            pad_to_max_length=True,
+            padding="max_length",
             return_tensors='pt',
             truncation=True
         )
@@ -100,7 +100,7 @@ class Collator(object):
         target = self.tokenizer.batch_encode_plus(
             target,
             max_length=self.answer_maxlength if self.answer_maxlength > 0 else None,
-            pad_to_max_length=True,
+            padding="max_length",
             return_tensors='pt',
             truncation=True if self.answer_maxlength > 0 else False,
         )
