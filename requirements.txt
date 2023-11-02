@@ -3,3 +3,4 @@ torch
 faiss-cpu
 transformers==4.16.0
 tensorboard
+sentencepiece
