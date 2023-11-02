@@ -89,7 +89,9 @@ class Options():
                         help='save model every <save_freq> steps during training')
         self.parser.add_argument('--eval_print_freq', type=int, default=1000,
                         help='print intermdiate results of evaluation every <eval_print_freq> steps')
-
+        self.parser.add_argument('--world_size', type=int, default=-1)
+        self.parser.add_argument('--global_rank', type=int, default=-1)
+        self.parser.add_argument('--n_gpu_per_node', type=int, default=-1)
 
     def print_options(self, opt):
         message = '\n'
