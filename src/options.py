@@ -23,6 +23,7 @@ class Options():
                         help='total number of step for the scheduler, if None then scheduler_total_step = total_step')
         self.parser.add_argument('--accumulation_steps', type=int, default=1)
         self.parser.add_argument('--dropout', type=float, default=0.1, help='dropout rate')
+        self.parser.add_argument('--classifier_dropout', type=float, default=0.1, help='dropout rate for classifier')
         self.parser.add_argument('--lr', type=float, default=1e-4, help='learning rate')
         self.parser.add_argument('--clip', type=float, default=1., help='gradient clipping')
         self.parser.add_argument('--optim', type=str, default='adam')
@@ -42,11 +43,21 @@ class Options():
         self.parser.add_argument('--use_checkpoint', action='store_true', help='use checkpoint in the encoder')
         self.parser.add_argument('--text_maxlength', type=int, default=200, 
                         help='maximum number of tokens in text segments (question+passage)')
-        self.parser.add_argument('--answer_maxlength', type=int, default=-1, 
+        self.parser.add_argument('--answer_maxlength', type=int, default=20,
                         help='maximum number of tokens used to train the model, no truncation if -1')
         self.parser.add_argument('--no_title', action='store_true', 
                         help='article titles not included in passages')
         self.parser.add_argument('--n_context', type=int, default=1)
+        self.parser.add_argument('--add_loss', type=str, default=None)
+        self.parser.add_argument('--add_type_emb', action='store_true')
+        self.parser.add_argument('--cat_emb', action='store_true')
+        self.parser.add_argument('--rerank', action='store_true')
+        self.parser.add_argument('--sample_pos_neg', action='store_true')
+        self.parser.add_argument('--extra_decoder_inputs', action='store_true')
+        self.parser.add_argument('--change_golden', action='store_true', help='change label 0 to 10000, label 1 to 0 in golden')
+        self.parser.add_argument('--split_psg_subset', action='store_true', help='')
+        self.parser.add_argument('--sum_golden_cross_att', action='store_true', help='')
+        self.parser.add_argument('--output_attentions', action='store_true', help='output attentions in decoder')
 
     def add_retriever_options(self):
         self.parser.add_argument('--train_data', type=str, default='none', help='path of train data')
@@ -71,14 +82,18 @@ class Options():
         self.parser.add_argument('--name', type=str, default='experiment_name', help='name of the experiment')
         self.parser.add_argument('--checkpoint_dir', type=str, default='./checkpoint/', help='models are saved here')
         self.parser.add_argument('--model_path', type=str, default='none', help='path for retraining')
+        self.parser.add_argument('--no_wandb', action='store_true', help='not to use wandb')
 
         # dataset parameters
-        self.parser.add_argument("--per_gpu_batch_size", default=1, type=int, 
+        self.parser.add_argument("--per_gpu_train_batch_size", default=1, type=int,
                         help="Batch size per GPU/CPU for training.")
+        self.parser.add_argument("--per_gpu_eval_batch_size", default=1, type=int,
+                                 help="Batch size per GPU/CPU for evaluating.")
         self.parser.add_argument('--maxload', type=int, default=-1)
 
         self.parser.add_argument("--local_rank", type=int, default=-1,
                         help="For distributed training: local_rank")
+        self.parser.add_argument('--cpu', action='store_true')
         self.parser.add_argument("--main_port", type=int, default=-1,
                         help="Main port (for multi-node SLURM jobs)")
         self.parser.add_argument('--seed', type=int, default=0, help="random seed for initialization")

@@ -7,6 +7,8 @@
 import torch
 import random
 import json
+import regex
+import string
 import numpy as np
 
 class Dataset(torch.utils.data.Dataset):
@@ -35,10 +37,32 @@ class Dataset(torch.utils.data.Dataset):
         else:
             return None
 
+
+    def check_answers(self, answers, passage):
+        def remove_articles(text):
+            return regex.sub(r'\b(a|an|the)\b', ' ', text)
+
+        def white_space_fix(text):
+            return ' '.join(text.split())
+
+        def remove_punc(text):
+            exclude = set(string.punctuation)
+            return ''.join(ch for ch in text if ch not in exclude)
+
+        def lower(text):
+            return text.lower()
+        passage = white_space_fix(remove_articles(remove_punc(lower(passage.strip()))))
+        for a in answers:
+            a_new = white_space_fix(remove_articles(remove_punc(lower(a.strip()))))
+            if a_new in passage:
+                return 1
+        return 0
+
     def __getitem__(self, index):
         example = self.data[index]
-        question = self.question_prefix + " " + example['question']
+        question = self.question_prefix + " " + example['question'] + " ?"
         target = self.get_target(example)
+        answers = example['answers']
 
         if 'ctxs' in example and self.n_context is not None:
             f = self.title_prefix + " {} " + self.passage_prefix + " {}"
@@ -46,19 +70,21 @@ class Dataset(torch.utils.data.Dataset):
             passages = [f.format(c['title'], c['text']) for c in contexts]
             scores = [float(c['score']) for c in contexts]
             scores = torch.tensor(scores)
+            golden =[self.check_answers(answers, c['title'] +'. ' + c['text']) for c in contexts]
             # TODO(egrave): do we want to keep this?
             if len(contexts) == 0:
                 contexts = [question]
         else:
-            passages, scores = None, None
-
+            passages, scores, golden = None, None, None
 
         return {
             'index' : index,
             'question' : question,
             'target' : target,
+            'candidate_answers': answers,
             'passages' : passages,
-            'scores' : scores
+            'scores' : scores,
+            'golden' : golden
         }
 
     def sort_data(self):
@@ -76,7 +102,7 @@ def encode_passages(batch_text_passages, tokenizer, max_length):
         p = tokenizer.batch_encode_plus(
             text_passages,
             max_length=max_length,
-            padding="max_length",
+            padding='max_length',
             return_tensors='pt',
             truncation=True
         )
@@ -87,11 +113,119 @@ def encode_passages(batch_text_passages, tokenizer, max_length):
     passage_masks = torch.cat(passage_masks, dim=0)
     return passage_ids, passage_masks.bool()
 
+def encode_passages_spans(batch_text_passages, batch_answers, tokenizer, max_length):
+    passage_ids, passage_masks = [], []
+    answers_token_ids = []
+    for k, text_passages in enumerate(batch_text_passages):
+        answer = batch_answers[k].lower().strip()
+        answer_starts_lens = [(psg.lower().index(answer), len(answer)) if answer in psg.lower() and psg.lower().index(answer)+ len(answer) <max_length else None for i, psg in enumerate(text_passages)]
+        p = tokenizer.batch_encode_plus(
+            text_passages,
+            max_length=max_length,
+            padding='max_length',
+            return_tensors='pt',
+            return_offsets_mapping=True,
+            truncation=True
+        )
+        passage_ids.append(p['input_ids'][None])
+        passage_masks.append(p['attention_mask'][None])
+
+        offset_mapping = p['offset_mapping']
+        answer_token_id = []
+        for i, a_s_l in enumerate(answer_starts_lens):
+            o_m = offset_mapping[i]
+            answer_token_start_end = []
+            if a_s_l is not None:
+                a_s = a_s_l[0]
+                a_e = a_s_l[0] + a_s_l[1]
+                for j, map in enumerate(o_m):
+                    if a_s >= map[0] and a_s < map[1]:
+                        if len(answer_token_start_end) == 0:
+                            answer_token_start_end.append(j)
+                    if a_e > map[0] and a_e <= map[1]:
+                        assert len(answer_token_start_end) == 1
+                        answer_token_start_end.append(j)
+                        break
+            else:
+                answer_token_start_end = [max_length, max_length]
+            if len(answer_token_start_end) < 2:
+                print("*******")
+                answer_token_start_end = [max_length, max_length]
+            answer_token_id.append(answer_token_start_end)
+        answers_token_ids.append(answer_token_id)
+    passage_ids = torch.cat(passage_ids, dim=0)
+    passage_masks = torch.cat(passage_masks, dim=0)
+    return passage_ids, passage_masks.bool(), torch.LongTensor(answers_token_ids)
+
+def encode_passages_group_tagger(batch_text_passages, batch_candidate_answers, tokenizer, max_length):
+    psg_num = len(batch_text_passages[0])
+    passage_ids, passage_masks, token_labels = [], [], []
+    for k, text_passages in enumerate(batch_text_passages):
+        p = tokenizer.batch_encode_plus(
+            text_passages,
+            max_length=max_length,
+            padding='max_length',
+            return_tensors='pt',
+            return_offsets_mapping=True,
+            truncation=True
+        )
+        passage_ids.append(p['input_ids'][None])
+        passage_masks.append(p['attention_mask'][None])
+
+        answers = [ans.lower().strip() for ans in batch_candidate_answers[k]]
+        passages = [psg.lower().strip() for psg in batch_text_passages[k]]
+        ans_loc = [[] for _ in range(psg_num)]
+        passages_with_golden = []
+        for pid, psg in enumerate(passages):
+            for aid, ans in enumerate(answers):
+                try:
+                    _ = regex.match(ans, psg)
+                except:
+                    continue
+                    #print('ANS: {} not match the rule of REGEX.'.format(ans))
+                else:
+                    for m in regex.finditer(ans, psg):
+                        ans_loc[pid] += [(m.start(), m.end())]
+                        if pid not in passages_with_golden:
+                            passages_with_golden += [pid]
+
+        p['token_labels'] = p['input_ids'].new(p['input_ids'].shape).fill_(0)
+        offset_mapping_with_golden = p['offset_mapping'][passages_with_golden]
+
+        for pid, passage_offset in enumerate(offset_mapping_with_golden):
+            for tid, token_offset in enumerate(passage_offset):
+                for ans_offset in ans_loc[passages_with_golden[pid]]:
+                    ans_begin, ans_end = ans_offset
+                    token_begin, token_end = token_offset
+                    if token_begin < ans_end and token_end > ans_begin:
+                        p['token_labels'][passages_with_golden[pid]][tid] = 1
+                        # for distance in range(-15, 16, 1):
+                        #     if tid+distance > 0 and tid+distance < max_length and  p['token_labels'][passages_with_golden[pid]][tid+distance] == -100:
+                        #         p['token_labels'][passages_with_golden[pid]][tid+distance] = 0
+
+
+        token_labels.append(p['token_labels'][None])
+
+    passage_ids = torch.cat(passage_ids, dim=0)
+    passage_masks = torch.cat(passage_masks, dim=0)
+    token_labels = torch.cat(token_labels, dim=0)
+    # for testing, the marked tokens should be all related to answers
+    '''
+    print('[ANS]')
+    print(batch_candidate_answers)
+    print('[PSG WITH ANS]')
+    print(tokenizer.batch_decode((passage_ids * (token_labels!=-100).bool().int())[0,:,:], skip_special_tokens=True))
+    import pdb; pdb.set_trace()
+    '''
+    return passage_ids, passage_masks.bool(), token_labels
+
 class Collator(object):
-    def __init__(self, text_maxlength, tokenizer, answer_maxlength=20):
+    def __init__(self, text_maxlength, tokenizer, answer_maxlength=20, add_loss=None, extra_decoder_inputs=False):
         self.tokenizer = tokenizer
         self.text_maxlength = text_maxlength
         self.answer_maxlength = answer_maxlength
+        self.add_loss = add_loss
+        self.extra_decoder_inputs = extra_decoder_inputs
 
     def __call__(self, batch):
         assert(batch[0]['target'] != None)
@@ -100,7 +234,7 @@ class Collator(object):
         target = self.tokenizer.batch_encode_plus(
             target,
             max_length=self.answer_maxlength if self.answer_maxlength > 0 else None,
-            padding="max_length",
+            padding='max_length',
             return_tensors='pt',
             truncation=True if self.answer_maxlength > 0 else False,
         )
@@ -108,16 +242,53 @@ class Collator(object):
         target_mask = target["attention_mask"].bool()
         target_ids = target_ids.masked_fill(~target_mask, -100)
 
+        if self.extra_decoder_inputs:
+            extra_decoder_inputs = ['The answer to question ' + ex['question'] + ' is ' + ex['target'] for ex in batch]
+
+
         def append_question(example):
             if example['passages'] is None:
                 return [example['question']]
             return [example['question'] + " " + t for t in example['passages']]
         text_passages = [append_question(example) for example in batch]
-        passage_ids, passage_masks = encode_passages(text_passages,
-                                                     self.tokenizer,
-                                                     self.text_maxlength)
+        # if self.add_loss == None:
+        #     passage_ids, passage_masks = encode_passages(text_passages,
+        #                                                  self.tokenizer,
+        #                                                  self.text_maxlength)
+        #     golden = None
+        if self.add_loss == None or self.add_loss in ["binary", "mse"]:
+            passage_ids, passage_masks = encode_passages(text_passages,
+                                                         self.tokenizer,
+                                                         self.text_maxlength)
+            golden = torch.tensor([ex['golden'] for ex in batch])
+        elif self.add_loss in ["span"]:
+            passage_ids, passage_masks, answer_token_ids = encode_passages_spans(
+                text_passages,
+                [ex['target'] for ex in batch],
+                self.tokenizer,
+                self.text_maxlength)
+            golden = answer_token_ids
+        elif self.add_loss in ["group_tagger"]:
+            passage_ids, passage_masks, answer_token_ids = encode_passages_group_tagger(
+                text_passages,
+                [ex['candidate_answers'] for ex in batch],
+                self.tokenizer,
+                self.text_maxlength,
+            )
+            golden = answer_token_ids
+        elif self.add_loss in ["binary_token"]:
+            passage_ids, passage_masks, answer_token_ids = encode_passages_group_tagger(
+                text_passages,
+                [ex['candidate_answers'] for ex in batch],
+                self.tokenizer,
+                self.text_maxlength,
+            )
+            golden_psg = torch.tensor([ex['golden'] for ex in batch])
+            golden = torch.cat([golden_psg.unsqueeze(-1), answer_token_ids], dim=-1)
+        else:
+            raise ValueError("Loss {} is not used".format(self.add_loss))
 
-        return (index, target_ids, target_mask, passage_ids, passage_masks)
+        return (index, target_ids, target_mask, passage_ids, passage_masks, golden)
 
 def load_data(data_path=None, global_rank=-1, world_size=-1):
     assert data_path
@@ -128,8 +299,8 @@ def load_data(data_path=None, global_rank=-1, world_size=-1):
             data = json.load(fin)
     examples = []
     for k, example in enumerate(data):
-        if global_rank > -1 and not k%world_size==global_rank:
-            continue
+        # if global_rank > -1 and not k%world_size==global_rank:
+        #     continue
         if data_path is not None and data_path.endswith('.jsonl'):
             example = json.loads(example)
         if not 'id' in example:
@@ -156,7 +327,7 @@ class RetrieverCollator(object):
         question = [ex['question'] for ex in batch]
         question = self.tokenizer.batch_encode_plus(
             question,
-            pad_to_max_length=True,
+            padding='max_length',
             return_tensors="pt",
             max_length=self.question_maxlength,
             truncation=True
@@ -206,7 +377,7 @@ class TextCollator(object):
         index = [x[0] for x in batch]
         encoded_batch = self.tokenizer.batch_encode_plus(
             [x[1] for x in batch],
-            pad_to_max_length=True,
+            padding='max_length',
             return_tensors="pt",
             max_length=self.maxlength,
             truncation=True
