@@ -9,13 +9,18 @@ import torch
 import transformers
 import torch.nn.functional as F
 from torch import nn
-from torch.nn import CrossEntropyLoss
+from torch.nn import CrossEntropyLoss, MSELoss
 import numpy as np
+from .modeling_t5 import T5ForConditionalGeneration
 
-class FiDT5(transformers.T5ForConditionalGeneration):
-    def __init__(self, config):
-        super().__init__(config)
-        self.wrap_encoder()
+class FiDT5(T5ForConditionalGeneration):
+    def __init__(self, config, opt):
+        super().__init__(config, opt)
+        self.extra_decoder_inputs = opt.extra_decoder_inputs
+        self.wrap_encoder(opt=opt)
+        self.split_psg_subset = opt.split_psg_subset if opt is not None else False
+        self.n_context = opt.n_context if opt is not None else False
+        self.output_attentions = opt.output_attentions if opt is not None else False
 
     def forward_(self, **kwargs):
         if 'input_ids' in kwargs:
@@ -39,26 +44,34 @@ class FiDT5(transformers.T5ForConditionalGeneration):
             input_ids = input_ids.view(input_ids.size(0), -1)
         if attention_mask != None:
             attention_mask = attention_mask.view(attention_mask.size(0), -1)
-        return super().forward(
+
+        Seq2SeqLMOutput = super().forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
             **kwargs
         )
 
+        return Seq2SeqLMOutput
+
     # We need to resize the inputs here, as the generate method expect 2D tensors
-    def generate(self, input_ids, attention_mask, max_length):
+    def generate(self, input_ids, attention_mask, add_loss, max_length):
         self.encoder.n_passages = input_ids.size(1)
+        if self.split_psg_subset and input_ids is not None:
+            for i in range(self.n_context):
+                input_ids = torch.cat([input_ids, input_ids], dim=0)
         return super().generate(
             input_ids=input_ids.view(input_ids.size(0), -1),
             attention_mask=attention_mask.view(attention_mask.size(0), -1),
-            max_length=max_length
+            max_length=max_length,
+            output_attentions=self.output_attentions,
+            return_dict_in_generate=self.output_attentions,
         )
 
-    def wrap_encoder(self, use_checkpoint=False):
+    def wrap_encoder(self, use_checkpoint=False, opt=None):
         """
         Wrap T5 encoder to obtain a Fusion-in-Decoder model.
         """
-        self.encoder = EncoderWrapper(self.encoder, use_checkpoint=use_checkpoint)
+        self.encoder = EncoderWrapper(self.encoder, use_checkpoint=use_checkpoint, opt=opt)
 
     def unwrap_encoder(self):
         """
@@ -73,7 +86,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
 
     def load_t5(self, state_dict):
         self.unwrap_encoder()
-        self.load_state_dict(state_dict)
+        self.load_state_dict(state_dict, False)
         self.wrap_encoder()
 
     def set_checkpoint(self, use_checkpoint):
@@ -130,21 +143,27 @@ class EncoderWrapper(torch.nn.Module):
     """
     Encoder Wrapper for T5 Wrapper to obtain a Fusion-in-Decoder model.
     """
-    def __init__(self, encoder, use_checkpoint=False):
+    def __init__(self, encoder, use_checkpoint=False, opt=None):
         super().__init__()
 
         self.encoder = encoder
-        self.main_input_name = encoder.main_input_name
         apply_checkpoint_wrapper(self.encoder, use_checkpoint)
+        self.base_model_prefix = ""
+        self.main_input_name = "input_ids"
+        self.split_psg_subset = opt.split_psg_subset if opt is not None else False
+        self.n_context = opt.n_context if opt is not None else False
+
 
     def forward(self, input_ids=None, attention_mask=None, **kwargs,):
         # total_length = n_passages * passage_length
-        bsz, total_length = input_ids.shape
+        bsz, total_length = attention_mask.shape
         passage_length = total_length // self.n_passages
+        if self.split_psg_subset and input_ids is not None:
+            input_ids = input_ids[:bsz, :]
         input_ids = input_ids.view(bsz*self.n_passages, passage_length)
         attention_mask = attention_mask.view(bsz*self.n_passages, passage_length)
         outputs = self.encoder(input_ids, attention_mask, **kwargs)
-        outputs = (outputs[0].view(bsz, self.n_passages*passage_length, -1), ) + outputs[1:]
+        outputs["last_hidden_state"] = outputs[0].view(bsz, self.n_passages*passage_length, -1)
         return outputs
 
 class CheckpointWrapper(torch.nn.Module):
@@ -357,3 +376,17 @@ class Retriever(transformers.PreTrainedModel):
         gold_score = torch.softmax(gold_score, dim=-1)
         score = torch.nn.functional.log_softmax(score, dim=-1)
         return self.loss_fct(score, gold_score)
+
+class FiDPooler(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.activation = nn.Tanh()
+
+    def forward(self, hidden_states):
+        # We "pool" the model by simply taking the hidden state corresponding
+        # to the first token.
+        first_token_tensor = hidden_states[:, :, 0, :]
+        pooled_output = self.dense(first_token_tensor)
+        pooled_output = self.activation(pooled_output)
+        return pooled_output
