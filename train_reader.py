@@ -3,7 +3,7 @@
 #
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
-
+import os
 import time
 import sys
 import torch
@@ -25,7 +25,8 @@ def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, c
     if opt.is_main:
         try:
             tb_logger = torch.utils.tensorboard.SummaryWriter(Path(opt.checkpoint_dir)/opt.name)
-        except:
+        except Exception as e:
+            print(e)
             tb_logger = None
             logger.warning('Tensorboard is not available.')
 
@@ -171,8 +172,9 @@ if __name__ == "__main__":
         world_size=opt.world_size,
     )
     eval_dataset = src.data.Dataset(eval_examples, opt.n_context)
-
-    if not checkpoint_exists and opt.model_path == "none":
+    load_path = checkpoint_path / 'checkpoint' / 'latest'
+    load_path_exists = os.path.exists(load_path)
+    if (not checkpoint_exists and opt.model_path == "none") | (not load_path_exists):
         t5 = transformers.T5ForConditionalGeneration.from_pretrained(model_name)
         model = src.model.FiDT5(t5.config)
         model.load_t5(t5.state_dict())
@@ -180,7 +182,6 @@ if __name__ == "__main__":
         optimizer, scheduler = src.util.set_optim(opt, model)
         step, best_dev_em = 0, 0.0
     elif opt.model_path == "none":
-        load_path = checkpoint_path / 'checkpoint' / 'latest'
         model, optimizer, scheduler, opt_checkpoint, step, best_dev_em = \
             src.util.load(model_class, load_path, opt, reset_params=False)
         logger.info(f"Model loaded from {load_path}")
